@@ -34,7 +34,7 @@ typedef struct {
   ngx_bufs_t deprecated_unused_bufs;
 
   /* Brotli encoder parameter: quality */
-  ngx_int_t quality;
+  ngx_http_complex_value_t *quality;
 
   /* Brotli encoder parameter: (max) lg_win */
   size_t lg_win;
@@ -113,9 +113,6 @@ static char* ngx_http_brotli_parse_wbits(ngx_conf_t* cf, void* post,
 
 /* Configuration literals. */
 
-static ngx_conf_num_bounds_t ngx_http_brotli_comp_level_bounds = {
-    ngx_conf_check_num_bounds, BROTLI_MIN_QUALITY, BROTLI_MAX_QUALITY};
-
 static ngx_conf_post_handler_pt ngx_http_brotli_parse_wbits_p =
     ngx_http_brotli_parse_wbits;
 
@@ -143,9 +140,9 @@ static ngx_command_t ngx_http_brotli_filter_commands[] = {
     {ngx_string("brotli_comp_level"),
      NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF |
          NGX_CONF_TAKE1,
-     ngx_conf_set_num_slot, NGX_HTTP_LOC_CONF_OFFSET,
+     ngx_http_set_complex_value_slot, NGX_HTTP_LOC_CONF_OFFSET,
      offsetof(ngx_http_brotli_conf_t, quality),
-     &ngx_http_brotli_comp_level_bounds},
+     NULL},
 
     {ngx_string("brotli_window"),
      NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF |
@@ -524,11 +521,43 @@ static ngx_int_t ngx_http_brotli_body_filter(ngx_http_request_t* r,
   return NGX_ERROR;
 }
 
+static ngx_int_t
+ngx_http_brotli_get_quality(ngx_http_brotli_conf_t *conf, ngx_http_request_t *r) {
+    ngx_str_t  quality_str;
+    ngx_int_t  quality;
+
+    if (conf->quality == NULL) {
+        return 6;
+    }
+
+    if (ngx_http_complex_value(r, conf->quality, &quality_str) != NGX_OK) {
+        return NGX_CONF_UNSET;
+    }
+
+    quality = ngx_atoi(quality_str.data, quality_str.len);
+    if (quality == NGX_ERROR) {
+        ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
+                      "brotli_comp_level value \"%V\" is not a valid number",
+                      &quality_str);
+        return NGX_CONF_UNSET;
+    }
+
+    if (quality < BROTLI_MIN_QUALITY || quality > BROTLI_MAX_QUALITY) {
+        ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
+                      "brotli_comp_level value %uD must be between 0 and 11",
+                      (uint32_t) quality);
+        return NGX_CONF_UNSET;
+    }
+
+    return quality;
+}
+
 static ngx_int_t ngx_http_brotli_filter_ensure_stream_initialized(
     ngx_http_request_t* r, ngx_http_brotli_ctx_t* ctx) {
   ngx_http_brotli_conf_t* conf;
   BROTLI_BOOL ok;
   size_t wbits;
+  ngx_int_t quality;
 
   if (ctx->initialized) {
     return NGX_OK;
@@ -536,6 +565,11 @@ static ngx_int_t ngx_http_brotli_filter_ensure_stream_initialized(
   ctx->initialized = 1;
 
   conf = ngx_http_get_module_loc_conf(r, ngx_http_brotli_filter_module);
+
+  quality = ngx_http_brotli_get_quality(conf, r);
+  if (quality == NGX_CONF_UNSET) {
+    return NGX_ERROR;
+  }
 
   /* Tune lg_win, if size is known. */
   if (ctx->content_length > 0) {
@@ -556,11 +590,11 @@ static ngx_int_t ngx_http_brotli_filter_ensure_stream_initialized(
   }
 
   ok = BrotliEncoderSetParameter(ctx->encoder, BROTLI_PARAM_QUALITY,
-                                 (uint32_t)conf->quality);
+                                 (uint32_t)quality);
   if (!ok) {
     ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
                   "BrotliEncoderSetParameter(QUALITY, %uD) failed",
-                  (uint32_t)conf->quality);
+                  (uint32_t)quality);
     return NGX_ERROR;
   }
 
@@ -587,7 +621,7 @@ static ngx_int_t ngx_http_brotli_filter_ensure_stream_initialized(
   ctx->out_chain->next = NULL;
 
   ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                 "brotli encoder initialized: lvl:%i win:%d", conf->quality,
+                 "brotli encoder initialized: lvl:%i win:%d", quality,
                  (1 << wbits));
 
   return NGX_OK;
@@ -710,7 +744,6 @@ static void* ngx_http_brotli_create_conf(ngx_conf_t* cf) {
 
   conf->enable = NGX_CONF_UNSET;
 
-  conf->quality = NGX_CONF_UNSET;
   conf->lg_win = NGX_CONF_UNSET_SIZE;
   conf->min_length = NGX_CONF_UNSET;
 
@@ -725,7 +758,9 @@ static char* ngx_http_brotli_merge_conf(ngx_conf_t* cf, void* parent,
 
   ngx_conf_merge_value(conf->enable, prev->enable, 0);
 
-  ngx_conf_merge_value(conf->quality, prev->quality, 6);
+  if (conf->quality == NULL) {
+    conf->quality = prev->quality;
+  }
   ngx_conf_merge_size_value(conf->lg_win, prev->lg_win, 19);
   ngx_conf_merge_value(conf->min_length, prev->min_length, 20);
 
