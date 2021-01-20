@@ -20,6 +20,11 @@
    IIUC, buffered == some data passed to filter has not been pushed further. */
 #define NGX_HTTP_BROTLI_BUFFERED NGX_HTTP_GZIP_BUFFERED
 
+typedef struct {
+    ngx_int_t                 value;
+    ngx_http_complex_value_t *cv;
+} ngx_http_brotli_quality_t;
+
 /* Module configuration. */
 typedef struct {
   ngx_flag_t enable;
@@ -34,7 +39,7 @@ typedef struct {
   ngx_bufs_t deprecated_unused_bufs;
 
   /* Brotli encoder parameter: quality */
-  ngx_http_complex_value_t *quality;
+  ngx_http_brotli_quality_t *quality;
 
   /* Brotli encoder parameter: (max) lg_win */
   size_t lg_win;
@@ -111,6 +116,10 @@ static ngx_int_t ngx_http_brotli_filter_init(ngx_conf_t* cf);
 static char* ngx_http_brotli_parse_wbits(ngx_conf_t* cf, void* post,
                                          void* data);
 
+static char* ngx_http_brotli_comp_level_set_slot(ngx_conf_t *cf,
+                                                 ngx_command_t *cmd,
+                                                 void *conf);
+
 /* Configuration literals. */
 
 static ngx_conf_post_handler_pt ngx_http_brotli_parse_wbits_p =
@@ -140,7 +149,7 @@ static ngx_command_t ngx_http_brotli_filter_commands[] = {
     {ngx_string("brotli_comp_level"),
      NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF |
          NGX_CONF_TAKE1,
-     ngx_http_set_complex_value_slot, NGX_HTTP_LOC_CONF_OFFSET,
+     ngx_http_brotli_comp_level_set_slot, NGX_HTTP_LOC_CONF_OFFSET,
      offsetof(ngx_http_brotli_conf_t, quality),
      NULL},
 
@@ -522,15 +531,13 @@ static ngx_int_t ngx_http_brotli_body_filter(ngx_http_request_t* r,
 }
 
 static ngx_int_t
-ngx_http_brotli_get_quality(ngx_http_brotli_conf_t *conf, ngx_http_request_t *r) {
+ngx_http_brotli_parse_quality(ngx_http_complex_value_t *cv, ngx_http_request_t *r) {
     ngx_str_t  quality_str;
     ngx_int_t  quality;
 
-    if (conf->quality == NULL) {
-        return 6;
-    }
+    ngx_log_error(NGX_LOG_INFO, r->connection->log, 0, "brotli parsing compression level");
 
-    if (ngx_http_complex_value(r, conf->quality, &quality_str) != NGX_OK) {
+    if (ngx_http_complex_value(r, cv, &quality_str) != NGX_OK) {
         return NGX_CONF_UNSET;
     }
 
@@ -550,6 +557,86 @@ ngx_http_brotli_get_quality(ngx_http_brotli_conf_t *conf, ngx_http_request_t *r)
     }
 
     return quality;
+}
+
+static ngx_int_t
+ngx_http_brotli_get_quality(ngx_http_brotli_conf_t *conf, ngx_http_request_t *r) {
+
+    if (conf->quality == NGX_CONF_UNSET_PTR) {
+        return 6;
+    }
+
+    if (conf->quality->cv == NULL) {
+        return conf->quality->value;
+    }
+
+    return ngx_http_brotli_parse_quality(conf->quality->cv, r);
+}
+
+static char *
+ngx_http_brotli_comp_level_set_slot(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf)
+{
+    ngx_http_brotli_conf_t *p = conf;
+
+    ngx_str_t                          *value;
+    ngx_http_complex_value_t            cv;
+    ngx_http_brotli_quality_t         **pquality, *quality;
+    ngx_http_compile_complex_value_t    ccv;
+
+    pquality = &p->quality;
+
+    if (*pquality != NGX_CONF_UNSET_PTR) {
+        return "is duplicate";
+    }
+
+    value = cf->args->elts;
+
+    ngx_memzero(&ccv, sizeof(ngx_http_compile_complex_value_t));
+
+    ccv.cf = cf;
+    ccv.value = &value[1];
+    ccv.complex_value = &cv;
+
+    if (ngx_http_compile_complex_value(&ccv) != NGX_OK) {
+        return NGX_CONF_ERROR;
+    }
+
+    quality = ngx_pcalloc(cf->pool, sizeof(ngx_http_brotli_quality_t));
+    if (quality == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    *pquality = quality;
+
+    if (cv.lengths) {
+        quality->cv = ngx_palloc(cf->pool, sizeof(ngx_http_complex_value_t));
+        if (quality->cv == NULL) {
+            return NGX_CONF_ERROR;
+        }
+
+        *quality->cv = cv;
+
+    } else {
+        quality->value = ngx_atoi(value[1].data, value[1].len);
+        if (quality->value == NGX_ERROR) {
+            ngx_conf_log_error(NGX_LOG_ALERT, cf, 0,
+                          "brotli_comp_level value \"%V\" is not a valid number",
+                          &value[1]);
+            return NGX_CONF_ERROR;
+        }
+
+        if (quality->value < BROTLI_MIN_QUALITY || quality->value > BROTLI_MAX_QUALITY) {
+            ngx_conf_log_error(NGX_LOG_ALERT, cf, 0,
+                          "brotli_comp_level value %uD must be between 0 and 11",
+                          (uint32_t) quality->value);
+            return NGX_CONF_ERROR;
+        }
+
+        quality->cv = NULL;
+    }
+
+    return NGX_CONF_OK;
 }
 
 static ngx_int_t ngx_http_brotli_filter_ensure_stream_initialized(
@@ -746,6 +833,7 @@ static void* ngx_http_brotli_create_conf(ngx_conf_t* cf) {
 
   conf->lg_win = NGX_CONF_UNSET_SIZE;
   conf->min_length = NGX_CONF_UNSET;
+  conf->quality = NGX_CONF_UNSET_PTR;
 
   return conf;
 }
@@ -758,9 +846,8 @@ static char* ngx_http_brotli_merge_conf(ngx_conf_t* cf, void* parent,
 
   ngx_conf_merge_value(conf->enable, prev->enable, 0);
 
-  if (conf->quality == NULL) {
-    conf->quality = prev->quality;
-  }
+  ngx_conf_merge_ptr_value(conf->quality,
+                            prev->quality, NULL);
   ngx_conf_merge_size_value(conf->lg_win, prev->lg_win, 19);
   ngx_conf_merge_value(conf->min_length, prev->min_length, 20);
 
